@@ -1,0 +1,7 @@
+names:
+  0: plate
+path: D:/unishit/terme 10/Data Mining/License Plate Recognition Project/License Plate
+  Recognition/license plate dataset
+test: test/images
+train: train/images
+val: valid/images

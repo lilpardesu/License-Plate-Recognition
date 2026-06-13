@@ -7,7 +7,7 @@ from ultralytics import YOLO
 def run_lpr():
     current_dir = os.path.dirname(os.path.abspath(__file__))
     model_path = os.path.join(current_dir, "best.pt")
-    input_path = os.path.abspath(os.path.join(current_dir, "license plate dataset", "test", "images"))
+    input_path = os.path.abspath(os.path.join(current_dir, "license plate dataset", "train", "images"))
     output_path = os.path.abspath(os.path.join(current_dir, "data", "results"))
 
     if not os.path.exists(model_path) or not os.path.exists(input_path):

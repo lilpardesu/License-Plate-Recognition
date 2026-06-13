@@ -19,28 +19,44 @@ def normalize_to_persian(text):
     return text.translate(trans)
 
 class FixedLengthCRNN(nn.Module):
-    def __init__(self, num_chars=8):
+    def __init__(self, num_chars=8, hidden_size=256):
         super().__init__()
         self.num_chars = num_chars
         
+        # CNN feature extraction (deeper)
         self.cnn = nn.Sequential(
-            nn.Conv2d(1, 64, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2, 2),
-            nn.Conv2d(64, 128, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2, 2),
-            nn.Conv2d(128, 256, 3, padding=1), nn.ReLU(),
-            nn.Conv2d(256, 256, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2, 1),
+            nn.Conv2d(1, 64, 3, padding=1), nn.ReLU(), nn.BatchNorm2d(64), nn.MaxPool2d(2, 2),
+            nn.Conv2d(64, 128, 3, padding=1), nn.ReLU(), nn.BatchNorm2d(128), nn.MaxPool2d(2, 2),
+            nn.Conv2d(128, 256, 3, padding=1), nn.ReLU(), nn.BatchNorm2d(256),
+            nn.Conv2d(256, 256, 3, padding=1), nn.ReLU(), nn.BatchNorm2d(256), nn.MaxPool2d(2, 1),
             nn.Conv2d(256, 512, 3, padding=1), nn.ReLU(), nn.BatchNorm2d(512),
-            nn.Conv2d(512, 512, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2, 1),
-            nn.Conv2d(512, 512, 2), nn.ReLU()
+            nn.Conv2d(512, 512, 3, padding=1), nn.ReLU(), nn.BatchNorm2d(512), nn.MaxPool2d(2, 1),
         )
         
-        self.pool = nn.AdaptiveAvgPool2d((1, num_chars))
-        self.classifier = nn.Linear(512, NUM_CLASSES)
+        # Calculate CNN output size: 128 -> 64 -> 32 -> 16 -> 8 (width), 32 -> 16 -> 8 -> 4 -> 2 (height)
+        # Actually for 128x32: after pools: 128/2/2 = 32 width, 32/2/2/2 = 4 height
+        self.adaptive_pool = nn.AdaptiveAvgPool2d((2, num_chars))  # (H=2, W=8)
+        
+        # BiLSTM for sequence modeling (THE MISSING PIECE!)
+        self.rnn = nn.LSTM(512*2, hidden_size, num_layers=2, 
+                          batch_first=True, bidirectional=True, dropout=0.3)
+        
+        self.classifier = nn.Linear(hidden_size*2, NUM_CLASSES)
         
     def forward(self, x):
-        features = self.cnn(x)
-        features = self.pool(features)
-        features = features.squeeze(2).permute(0, 2, 1)
-        return self.classifier(features)
+        # CNN
+        conv = self.cnn(x)  # (B, 512, H, W)
+        conv = self.adaptive_pool(conv)  # (B, 512, 2, 8)
+        
+        # Reshape for RNN: (B, 512*2, 8) -> (B, 8, 1024)
+        b, c, h, w = conv.size()
+        conv = conv.view(b, c*h, w).permute(0, 2, 1)  # (B, 8, 1024)
+        
+        # BiLSTM
+        rnn_out, _ = self.rnn(conv)  # (B, 8, 512)
+        
+        # Classify each position
+        return self.classifier(rnn_out)  # (B, 8, NUM_CLASSES)
 
 class PlateDataset(Dataset):
     def __init__(self, csv_file='labels.csv', img_dir='data/results', augment=True):
@@ -62,25 +78,65 @@ class PlateDataset(Dataset):
         if img is None:
             return None
         
-        # Safety check: ensure grayscale even if imread ignored the flag
         if len(img.shape) == 3:
             img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         
         if self.augment:
+            # 1. Perspective transform (simulate camera angle)
             if np.random.random() > 0.5:
-                angle = np.random.uniform(-3, 3)
+                h, w = img.shape
+                pts1 = np.float32([[0,0], [w,0], [w,h], [0,h]])
+                shift = np.random.randint(3, 8)
+                pts2 = np.float32([
+                    [np.random.randint(0, shift), np.random.randint(0, shift)],
+                    [w-np.random.randint(0, shift), np.random.randint(0, shift)],
+                    [w-np.random.randint(0, shift), h-np.random.randint(0, shift)],
+                    [np.random.randint(0, shift), h-np.random.randint(0, shift)]
+                ])
+                M = cv2.getPerspectiveTransform(pts1, pts2)
+                img = cv2.warpPerspective(img, M, (w, h), borderValue=127)
+            
+            # 2. Elastic deformation (simulate plate bending/warping)
+            if np.random.random() > 0.7:
+                img = self.elastic_transform(img)
+            
+            # 3. Rotation (-5 to 5 degrees)
+            if np.random.random() > 0.5:
+                angle = np.random.uniform(-5, 5)
                 h, w = img.shape
                 M = cv2.getRotationMatrix2D((w//2, h//2), angle, 1.0)
                 img = cv2.warpAffine(img, M, (w, h), borderValue=127)
+            
+            # 4. Brightness/Contrast
+            if np.random.random() > 0.5:
+                alpha = np.random.uniform(0.8, 1.2)  # Contrast
+                beta = np.random.randint(-20, 20)    # Brightness
+                img = cv2.convertScaleAbs(img, alpha=alpha, beta=beta)
+            
+            # 5. Blur (motion blur common in plates)
+            if np.random.random() > 0.7:
+                k = np.random.choice([3, 5])
+                img = cv2.GaussianBlur(img, (k, k), 0)
         
         img = cv2.resize(img, (128, 32))
         img = (img.astype(np.float32) / 255.0 - 0.5) / 0.5
         
-        # Ensure exactly 8 characters, pad with Persian zero '۰' if needed
         text = row['text'][:8].ljust(8, '۰')
         labels = [CHAR_TO_IDX.get(c, 0) for c in text[:8]]
         
         return torch.FloatTensor(img).unsqueeze(0), torch.LongTensor(labels)
+
+    def elastic_transform(self, image, alpha=36, sigma=6):
+        """Elastic deformation for data augmentation"""
+        shape = image.shape
+        dx = cv2.GaussianBlur((np.random.rand(*shape) * 2 - 1), (0,0), sigma) * alpha
+        dy = cv2.GaussianBlur((np.random.rand(*shape) * 2 - 1), (0,0), sigma) * alpha
+        
+        x, y = np.meshgrid(np.arange(shape[1]), np.arange(shape[0]))
+        map_x = (x + dx).astype(np.float32)
+        map_y = (y + dy).astype(np.float32)
+        
+        return cv2.remap(image, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderValue=127)
 
 def collate_fn(batch):
     batch = [b for b in batch if b is not None]
@@ -110,6 +166,13 @@ if __name__ == "__main__":
     print(f"Characters: {CHARS[:20]}... (total: {NUM_CLASSES})")
 
     best_acc = 0
+
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode='max',
+        factor=0.5,
+        patience=5,
+    )
 
     for epoch in range(100):
         model.train()
@@ -166,4 +229,7 @@ if __name__ == "__main__":
             torch.save(model.state_dict(), 'crnn_persian_best.pt')
             print(f"  -> Saved! Best: {best_acc:.1f}%")
 
+        scheduler.step(plate_acc)
+
     print(f"Done. Best accuracy: {best_acc:.1f}%")
+    

@@ -1,0 +1,10 @@
+path: data/processed  # Root directory
+train: train/images
+val: validation/images
+test: test/images
+
+names:
+  0: license_plate
+
+# Optional but helpful
+nc: 1

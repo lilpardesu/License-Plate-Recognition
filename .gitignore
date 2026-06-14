@@ -2,3 +2,12 @@ runs/
 *.pt
 __pycache__/
 .ipynb_checkpoints/
+
+# Dataset folders
+dataset/
+data/
+datasets/
+*.jpg
+*.jpeg
+*.png
+*.zip

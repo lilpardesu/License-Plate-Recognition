@@ -3,10 +3,8 @@ runs/
 __pycache__/
 .ipynb_checkpoints/
 
-# Dataset folders
-dataset/
+# Dataset folder
 data/
-datasets/
 *.jpg
 *.jpeg
 *.png

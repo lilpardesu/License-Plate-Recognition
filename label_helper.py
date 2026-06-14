@@ -1,88 +1,74 @@
 import os
-import cv2
 import pandas as pd
+import shutil
 
 def label_plates():
     results_dir = 'data/results'
     csv_file = 'labels.csv'
     
-    # Load existing labels
-    labeled = set()
-    if os.path.exists(csv_file):
-        df = pd.read_csv(csv_file)
-        labeled = set(df['filename'].tolist())
-        print(f"Resuming: {len(labeled)} images already labeled")
-    
-    # Get remaining images
-    all_images = sorted([f for f in os.listdir(results_dir) if f.endswith('.jpg')])
-    remaining = [f for f in all_images if f not in labeled]
-    
-    if not remaining:
-        print("All images labeled!")
+
+    start_index = 1032
+
+    if not os.path.exists(results_dir):
+        print("Folder not found:", results_dir)
         return
-    
-    print(f"\nLabeling {len(remaining)} remaining images...")
-    print("Commands: type plate text | 'skip' to skip | 'quit' to save and exit\n")
-    
-    new_labels = []
-    
-    for i, img_file in enumerate(remaining, 1):
-        img_path = os.path.join(results_dir, img_file)
-        img = cv2.imread(img_path)
-        
-        # Show image
-        cv2.imshow(f'Labeling ({i}/{len(remaining)})', img)
-        key = cv2.waitKey(1)  # Required to refresh window
-        
-        # Get user input
-        user_input = input(f"[{i}/{len(remaining)}] {img_file}: ").strip()
-        
-        # Handle commands
-        if user_input.lower() == 'quit':
-            print("Saving and quitting...")
+
+
+    all_images = sorted([
+        f for f in os.listdir(results_dir)
+        if f.lower().endswith(('.jpg', '.png', '.jpeg'))
+    ])
+
+    if start_index >= len(all_images):
+        print(f"Index {start_index} is out of range. Total: {len(all_images)}")
+        return
+
+    remaining = all_images[start_index:]
+
+    print(f"Total images: {len(all_images)}")
+    print(f"Starting tomorrow from index: {start_index} (File: {remaining[0]})")
+
+    for i, img_file in enumerate(remaining, start=start_index + 1):
+        img_path = os.path.abspath(os.path.join(results_dir, img_file))
+
+        os.system(f'start "" "{img_path}"')
+
+        prompt = f"[{i}/{len(all_images)}] Plate for {img_file} (skip/quit): "
+        text = input(prompt).strip()
+
+        if text.lower() == "quit":
             break
-            
-        elif user_input.lower() == 'skip':
-            print(f"  -> Skipped {img_file}")
-            cv2.destroyAllWindows()
-            continue  # Move to next image
-            
-        elif user_input:  # If not empty
-            # Clean: remove spaces, keep Persian letters and digits
-            clean_text = user_input.replace(' ', '')
-            new_labels.append({'filename': img_file, 'text': clean_text})
-            print(f"  -> Saved: {clean_text}")
-            
-            # Save every 5 labels to prevent data loss
-            if len(new_labels) % 5 == 0:
-                save_to_csv(new_labels, csv_file, labeled)
-                print(f"  (Auto-saved {len(new_labels)} new labels)")
-        
-        cv2.destroyAllWindows()
-    
-    # Final save
-    if new_labels:
-        save_to_csv(new_labels, csv_file, labeled)
-        total = len(labeled) + len(new_labels)
-        print(f"\nDone! Total labeled: {total}")
-    
-    cv2.destroyAllWindows()
+        if text.lower() == "skip":
+            continue
 
-def save_to_csv(new_labels, csv_file, existing_set):
-    """Append new labels to existing CSV"""
-    df_new = pd.DataFrame(new_labels)
-    
+
+        save_to_csv_safe([{"filename": img_file, "text": text.replace(" ", "")}], csv_file)
+        print(f"Saved: {text}")
+
+def save_to_csv_safe(new_labels, csv_file):
+
     if os.path.exists(csv_file):
-        df_old = pd.read_csv(csv_file)
-        df_combined = pd.concat([df_old, df_new], ignore_index=True)
-    else:
-        df_combined = df_new
-    
-    df_combined.to_csv(csv_file, index=False)
+        shutil.copy(csv_file, csv_file + ".bak")
 
-if __name__ == '__main__':
-    try:
-        label_plates()
-    except KeyboardInterrupt:
-        print("\nInterrupted! Progress saved.")
-        cv2.destroyAllWindows()
+    df_new = pd.DataFrame(new_labels)
+    if os.path.exists(csv_file):
+        df_old = None
+        for enc in ['utf-8-sig', 'cp1252', 'latin-1']:
+            try:
+                df_old = pd.read_csv(csv_file, encoding=enc)
+                break
+            except:
+                continue
+        
+        if df_old is not None:
+            df = pd.concat([df_old, df_new], ignore_index=True)
+            df = df.drop_duplicates(subset=['filename'], keep='last')
+        else:
+            df = df_new
+    else:
+        df = df_new
+
+    df.to_csv(csv_file, index=False, encoding='utf-8-sig')
+
+if __name__ == "__main__":
+    label_plates()

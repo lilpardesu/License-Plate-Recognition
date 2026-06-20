@@ -38,37 +38,99 @@ class CRNN(nn.Module):
         rnn_out, _ = self.rnn(conv)
         return torch.log_softmax(self.fc(rnn_out), dim=2)
 
-def ctc_decode(logits, idx_to_char):
+def ctc_decode_tokens(logits, idx_to_char):
+    """CTC greedy decode, returns token list and joined raw string."""
     pred = torch.argmax(logits[0], dim=1).cpu().numpy()
-    text = []
-    prev = -1
+    tokens, prev = [], -1
     for p in pred:
         if p != prev and p != 0:  # 0 = CTC blank
-            text.append(idx_to_char.get(int(p), ""))
+            tokens.append(idx_to_char.get(int(p), ""))
         prev = p
-    return "".join(text)
+    raw = "".join(tokens)
+    return tokens, raw
 
 # ----------------- Helpers -----------------
-def is_digit_any(ch: str) -> bool:
-    return ch.isdigit() or ch in "۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩"
+PERSIAN_DIGITS = "۰۱۲۳۴۵۶۷۸۹"
+ARABIC_DIGITS = "٠١٢٣٤٥٦٧٨٩"
+EN_DIGITS = "0123456789"
+DIGIT_MAP = {**{p: e for p, e in zip(PERSIAN_DIGITS, EN_DIGITS)},
+             **{a: e for a, e in zip(ARABIC_DIGITS, EN_DIGITS)}}
+
+# common IR plate letters (plus multi-char token "الف")
+VALID_LETTERS = {
+    "الف", "ب", "ج", "د", "س", "ص", "ط", "ق", "ل", "م",
+    "ن", "و", "ه", "ی", "ک", "ع", "پ", "ت"
+}
+
+def to_en_digit(ch: str) -> str:
+    return DIGIT_MAP.get(ch, ch)
+
+def is_any_digit(ch: str) -> bool:
+    c = to_en_digit(ch)
+    return c.isdigit()
+
+def normalize_text(s: str) -> str:
+    if s is None:
+        return ""
+    s = s.strip().replace(" ", "")
+    s = "".join(to_en_digit(ch) for ch in s)
+    return s
+
+def extract_letter_and_digits(raw_text: str):
+    """
+    Robust extraction:
+    - prioritizes 'الف' as one letter token
+    - otherwise picks first valid non-digit letter
+    """
+    s = normalize_text(raw_text)
+
+    # 1) explicit 'الف'
+    if "الف" in s:
+        s_wo = s.replace("الف", "", 1)
+        digits = "".join(ch for ch in s_wo if ch.isdigit())
+        return "الف", digits
+
+    # 2) other letters
+    letter = ""
+    for ch in s:
+        if not ch.isdigit() and ch in VALID_LETTERS:
+            letter = ch
+            break
+
+    # remove first occurrence of selected letter from s
+    s_wo = s
+    if letter:
+        idx = s_wo.find(letter)
+        if idx != -1:
+            s_wo = s_wo[:idx] + s_wo[idx + len(letter):]
+
+    digits = "".join(ch for ch in s_wo if ch.isdigit())
+    return letter, digits
 
 def format_plate_segments(raw_text: str):
     """
-    Output target:
-    [2 digits] [letter] [3 digits] [2 digits]
-    Example: 47 ط 738 19
+    Target display: [2 digits] [letter] [3 digits] [2 digits]
+    For imperfect OCR (e.g., 6 digits), keep best-effort but preserve letter.
     """
-    s = (raw_text or "").strip().replace(" ", "")
-    digits = [c for c in s if is_digit_any(c)]
-    letters = [c for c in s if (not is_digit_any(c)) and c.strip()]
+    letter, digits = extract_letter_and_digits(raw_text)
 
-    if len(digits) >= 7 and len(letters) >= 1:
-        d = "".join(digits[:7])
-        l = letters[0]
-        return d[:2], l, d[2:5], d[5:7]
+    # perfect case
+    if len(digits) >= 7:
+        d = digits[:7]
+        return d[:2], letter if letter else "?", d[2:5], d[5:7]
 
-    # fallback (if OCR output incomplete)
-    return s, "", "", ""
+    # best-effort for missing digits
+    if len(digits) >= 5:
+        first2 = digits[:2]
+        last2 = digits[-2:]
+        mid = digits[2:-2]  # may be 1..3 chars
+        return first2, letter if letter else "?", mid, last2
+
+    if len(digits) >= 2:
+        return digits[:2], letter if letter else "?", digits[2:], ""
+
+    # fallback
+    return raw_text, "", "", ""
 
 def safe_crop(img, x1, y1, x2, y2):
     h, w = img.shape[:2]
@@ -92,7 +154,7 @@ def load_models():
     yolo = YOLO(YOLO_WEIGHTS)
 
     ckpt = torch.load(CRNN_WEIGHTS, map_location=device)
-    chars = ckpt["chars"]  # char -> idx
+    chars = ckpt["chars"]  # token -> idx
     idx_to_char = {v: k for k, v in chars.items()}
 
     crnn = CRNN(num_classes=len(chars)).to(device)
@@ -101,44 +163,75 @@ def load_models():
 
     return yolo, crnn, idx_to_char, device
 
-# ----------------- Inference -----------------
-def run_lpr(img_bgr, yolo, crnn, idx_to_char, device):
+# ----------------- Multi-plate inference -----------------
+def run_lpr_multi(img_bgr, yolo, crnn, idx_to_char, device, conf_thresh=0.25):
     results = yolo(img_bgr, verbose=False)[0]
+    vis = img_bgr.copy()
 
     if results.boxes is None or len(results.boxes) == 0:
-        return None, None, None, None, "No plate detected"
+        return vis, []
 
+    boxes = results.boxes.xyxy.cpu().numpy().astype(int)
     confs = results.boxes.conf.cpu().numpy()
-    best_idx = int(np.argmax(confs))
-    conf = float(confs[best_idx])
 
-    x1, y1, x2, y2 = results.boxes.xyxy[best_idx].cpu().numpy().astype(int)
-    plate = safe_crop(img_bgr, x1, y1, x2, y2)
-    if plate is None:
-        return None, None, None, None, "Invalid crop"
+    valid_idxs = [i for i, c in enumerate(confs) if float(c) >= conf_thresh]
+    if len(valid_idxs) == 0:
+        return vis, []
 
-    # OCR preprocessing (your stable version)
-    gray = cv2.cvtColor(plate, cv2.COLOR_BGR2GRAY)
-    pre = cv2.resize(gray, (OCR_W, OCR_H), interpolation=cv2.INTER_LINEAR)
+    valid_idxs.sort(key=lambda i: boxes[i][0])  # left-to-right
 
-    x = pre.astype(np.float32) / 255.0
-    x = torch.from_numpy(x).unsqueeze(0).unsqueeze(0).to(device)
+    outputs = []
+    plate_id = 1
 
-    with torch.no_grad():
-        logits = crnn(x)
+    for i in valid_idxs:
+        x1, y1, x2, y2 = boxes[i]
+        conf = float(confs[i])
 
-    raw_text = ctc_decode(logits, idx_to_char)
-    seg1, seg2, seg3, seg4 = format_plate_segments(raw_text)
+        plate = safe_crop(img_bgr, x1, y1, x2, y2)
+        if plate is None:
+            continue
 
-    vis = img_bgr.copy()
-    cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        gray = cv2.cvtColor(plate, cv2.COLOR_BGR2GRAY)
+        pre = cv2.resize(gray, (OCR_W, OCR_H), interpolation=cv2.INTER_LINEAR)
 
-    return vis, plate, pre, conf, (raw_text, seg1, seg2, seg3, seg4)
+        x = pre.astype(np.float32) / 255.0
+        x = torch.from_numpy(x).unsqueeze(0).unsqueeze(0).to(device)
+
+        with torch.no_grad():
+            logits = crnn(x)
+
+        tokens, raw_text = ctc_decode_tokens(logits, idx_to_char)
+        s1, s2, s3, s4 = format_plate_segments(raw_text)
+        formatted = " ".join([p for p in [s1, s2, s3, s4] if p != ""]).strip()
+
+        cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        cv2.putText(
+            vis, f"#{plate_id}", (x1, max(20, y1 - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA
+        )
+
+        outputs.append({
+            "id": plate_id,
+            "bbox": (x1, y1, x2, y2),
+            "conf": conf,
+            "tokens": tokens,
+            "raw_text": raw_text,
+            "seg1": s1,
+            "seg2": s2,
+            "seg3": s3,
+            "seg4": s4,
+            "formatted": formatted,
+            "crop": plate,
+            "pre": pre
+        })
+        plate_id += 1
+
+    return vis, outputs
 
 # ----------------- UI -----------------
-st.set_page_config(page_title="LPR Visual Demo", layout="wide")
-st.title("🚘 License Plate Recognition (Visual Demo)")
-st.write("Upload image → detect plate → OCR")
+st.set_page_config(page_title="LPR Visual Demo (Multi-Plate)", layout="wide")
+st.title("🚘 License Plate Recognition (Multi-Plate Visual Demo)")
+st.write("Upload image → detect all plates → OCR each plate")
 
 try:
     yolo, crnn, idx_to_char, device = load_models()
@@ -146,6 +239,8 @@ try:
 except Exception as e:
     st.error(str(e))
     st.stop()
+
+conf_thresh = st.slider("Detection confidence threshold", 0.05, 0.95, 0.25, 0.05)
 
 uploaded = st.file_uploader("Choose an image", type=["jpg", "jpeg", "png", "bmp", "webp"])
 
@@ -161,46 +256,53 @@ if uploaded is not None:
     st.image(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB), use_container_width=True)
 
     if st.button("Run LPR", type="primary"):
-        vis, plate, pre, conf, out = run_lpr(img_bgr, yolo, crnn, idx_to_char, device)
+        vis, outputs = run_lpr_multi(img_bgr, yolo, crnn, idx_to_char, device, conf_thresh=conf_thresh)
 
-        if vis is None:
-            st.warning(out)
+        if len(outputs) == 0:
+            st.warning("No plates detected above threshold.")
+            st.image(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB), caption="Detections", use_container_width=True)
         else:
-            raw_text, s1, s2, s3, s4 = out
+            st.subheader(f"Detected plates: {len(outputs)}")
+            st.image(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB), caption="All detected plates", use_container_width=True)
 
-            st.subheader("Prediction")
+            for out in outputs:
+                st.markdown(f"### Plate #{out['id']}")
 
-            # Fixed visual order using flex (prevents RTL/LTR reordering issue)
-            st.markdown(
-                f"""
-                <div style="
-                    display:flex;
-                    gap:12px;
-                    align-items:center;
-                    font-size:40px;
-                    font-weight:700;
-                    font-family: Arial, Tahoma, sans-serif;
-                    background:#0f172a;
-                    color:#86efac;
-                    padding:10px 14px;
-                    border-radius:10px;
-                    width:fit-content;
-                ">
-                    <span dir="ltr">{s1}</span>
-                    <span dir="rtl">{s2}</span>
-                    <span dir="ltr">{s3}</span>
-                    <span dir="ltr">{s4}</span>
-                </div>
-                """,
-                unsafe_allow_html=True
-            )
+                st.markdown(
+                    f"""
+                    <div style="
+                        display:flex;
+                        gap:12px;
+                        align-items:center;
+                        font-size:36px;
+                        font-weight:700;
+                        font-family: Arial, Tahoma, sans-serif;
+                        background:#0f172a;
+                        color:#86efac;
+                        padding:10px 14px;
+                        border-radius:10px;
+                        width:fit-content;
+                        margin-bottom:8px;
+                    ">
+                        <span dir="ltr">{out['seg1']}</span>
+                        <span dir="rtl">{out['seg2']}</span>
+                        <span dir="ltr">{out['seg3']}</span>
+                        <span dir="ltr">{out['seg4']}</span>
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
 
-            st.write(f"**Detection confidence:** `{conf:.4f}`")
+                st.caption(f"Raw OCR: {out['raw_text']}")
+                st.caption(f"Tokens: {out['tokens']}")
+                st.write(f"**Detection confidence:** `{out['conf']:.4f}`")
+                x1, y1, x2, y2 = out["bbox"]
+                st.write(f"**BBox:** `({x1}, {y1}, {x2}, {y2})`")
 
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                st.image(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB), caption="Detected plate box", use_container_width=True)
-            with c2:
-                st.image(cv2.cvtColor(plate, cv2.COLOR_BGR2RGB), caption="Plate crop", use_container_width=True)
-            with c3:
-                st.image(pre, caption="OCR input (grayscale 128x32)", use_container_width=True)
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.image(cv2.cvtColor(out["crop"], cv2.COLOR_BGR2RGB), caption=f"Plate #{out['id']} crop", use_container_width=True)
+                with c2:
+                    st.image(out["pre"], caption=f"Plate #{out['id']} OCR input (128x32)", use_container_width=True)
+
+                st.divider()

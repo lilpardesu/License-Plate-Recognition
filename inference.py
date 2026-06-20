@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 from ultralytics import YOLO
 import numpy as np
+from preprocess_ocr import preprocess_plate
 
 # ---------- CRNN definition (must match training) ----------
 class CRNN(nn.Module):
@@ -56,7 +57,6 @@ def load_crnn(path, device):
 
 def run(image_path):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
     yolo = YOLO('ir_plate_detector/weights/best.pt')
     crnn, idx_to_char = load_crnn('models/crnn/crnn_best.pt', device)
 
@@ -67,7 +67,6 @@ def run(image_path):
         print("No plate detected")
         return
 
-    # choose highest confidence box
     confs = res.boxes.conf.cpu().numpy()
     i = int(np.argmax(confs))
     x1,y1,x2,y2 = res.boxes.xyxy[i].cpu().numpy().astype(int)
@@ -77,12 +76,19 @@ def run(image_path):
         print("Invalid crop")
         return
 
-    inp = preprocess_plate(plate).to(device)
+    # Apply full preprocessing pipeline
+    processed = preprocess_plate(plate)
+    
+    # Convert to tensor (already 128x32 from preprocess_plate)
+    x = processed.astype(np.float32) / 255.0
+    x = torch.from_numpy(x).unsqueeze(0).unsqueeze(0).to(device)
+    
     with torch.no_grad():
-        logits = crnn(inp)  # B,T,C
-    text = ctc_decode(logits, idx_to_char)
+        logits = crnn(x)
+    text = decode(logits, idx_to_char)
 
     print("Predicted plate text:", text)
+    return text
 
 if __name__ == "__main__":
     run("data/test/day_00010.jpg")  # change this

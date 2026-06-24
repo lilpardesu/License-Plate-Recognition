@@ -1,87 +1,46 @@
-import os
-import xml.etree.ElementTree as ET
 import pandas as pd
-from pathlib import Path
+import editdistance
+import os
 
-def parse_xml(xml_path):
-    tree = ET.parse(xml_path)
-    root = tree.getroot()
-    
-    plate_box = None
-    chars = []
-    
-    for obj in root.findall('object'):
-        name = obj.find('name').text
-        bndbox = obj.find('bndbox')
-        xmin = int(bndbox.find('xmin').text)
-        
-        if name == "کل ناحیه پلاک":  # Full plate box
-            plate_box = {
-                'xmin': xmin,
-                'ymin': int(bndbox.find('ymin').text),
-                'xmax': int(bndbox.find('xmax').text),
-                'ymax': int(bndbox.find('ymax').text)
-            }
-        else:  # Individual character
-            chars.append((xmin, name))
-    
-    # Sort chars left-to-right
-    chars.sort(key=lambda x: x[0])
-    text = ''.join([c[1] for c in chars])
-    
-    return plate_box, text
+RESULTS_CSV = "evaluation_results.csv"
 
-def process_split(split_name):
-    input_dir = f"data/{split_name}"
-    if not os.path.exists(input_dir):
-        print(f"❌ Folder not found: {input_dir}")
-        return 0
-    
-    os.makedirs('data/processed', exist_ok=True)
-    
-    ocr_data = []
-    xml_files = list(Path(input_dir).glob("*.xml"))
-    print(f"📁 Processing {split_name}: {len(xml_files)} XML files found")
-    
-    for xml_path in xml_files:
-        try:
-            plate_box, text = parse_xml(xml_path)
-            if plate_box and text:
-                # Find matching image (jpg or png)
-                img_name = xml_path.with_suffix('.jpg').name
-                img_path = xml_path.with_suffix('.jpg')
-                if not img_path.exists():
-                    img_path = xml_path.with_suffix('.png')
-                    img_name = xml_path.with_suffix('.png').name
-                
-                if img_path.exists():
-                    ocr_data.append({
-                        'filename': img_name,
-                        'text': text,
-                        'xmin': plate_box['xmin'],
-                        'ymin': plate_box['ymin'],
-                        'xmax': plate_box['xmax'],
-                        'ymax': plate_box['ymax']
-                    })
-        except Exception as e:
-            print(f"   Error parsing {xml_path}: {e}")
-    
-    if ocr_data:
-        df = pd.DataFrame(ocr_data)
-        csv_path = f"data/processed/{split_name}_ocr_labels.csv"
-        df.to_csv(csv_path, index=False)
-        print(f"✅ Created: {csv_path} ({len(ocr_data)} plates)")
-        return len(ocr_data)
-    return 0
+def main():
+    if not os.path.exists(RESULTS_CSV):
+        print(f"❌ Not found: {RESULTS_CSV}")
+        print("Run evaluate.py first to generate evaluation_results.csv")
+        return
 
-# Run for all splits
-total = 0
-for split in ['train', 'validation', 'test']:
-    count = process_split(split)
-    total += count
+    df = pd.read_csv(RESULTS_CSV)
 
-print(f"\n🎉 Total plates parsed: {total}")
-if total > 0:
-    print("👉 Now run: python extract_plates.py")
-else:
-    print("❌ Check that data/train, data/validation, data/test exist with XML files")
+    if "predicted" not in df.columns or "ground_truth" not in df.columns:
+        print("❌ CSV must contain columns: predicted, ground_truth")
+        return
+
+    preds = df["predicted"].fillna("").astype(str).tolist()
+    gts = df["ground_truth"].fillna("").astype(str).tolist()
+
+    n = len(preds)
+    if n == 0:
+        print("❌ Empty evaluation_results.csv")
+        return
+
+    exact = sum(p == g for p, g in zip(preds, gts))
+    wer = (n - exact) / n * 100.0
+
+    total_chars = sum(len(g) for g in gts)
+    edits = sum(editdistance.eval(p, g) for p, g in zip(preds, gts))
+    cer = (edits / total_chars * 100.0) if total_chars > 0 else 0.0
+
+    # Character Accuracy = 1 - CER
+    char_acc = 100.0 - cer
+
+    print("\n" + "=" * 55)
+    print(f"Samples: {n}")
+    print(f"Exact Match Accuracy: {exact / n * 100:.2f}%")
+    print(f"Word Error Rate (WER): {wer:.2f}%")
+    print(f"Character Error Rate (CER): {cer:.2f}%")
+    print(f"Character Accuracy: {char_acc:.2f}%")
+    print("=" * 55)
+
+if __name__ == "__main__":
+    main()

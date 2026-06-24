@@ -12,23 +12,12 @@ PLATE_LABEL = "کل ناحیه پلاک"
 OCR_ROOT = os.path.join(DATA_ROOT, "ocr")
 VALID_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
-# Persian + Arabic digits -> English
+# Persian digits -> English
 DIGIT_MAP = {
     "۰": "0", "۱": "1", "۲": "2", "۳": "3", "۴": "4",
     "۵": "5", "۶": "6", "۷": "7", "۸": "8", "۹": "9",
-    "٠": "0", "١": "1", "٢": "2", "٣": "3", "٤": "4",
-    "٥": "5", "٦": "6", "٧": "7", "٨": "8", "٩": "9",
 }
 
-# Arabic forms -> Persian canonical
-CHAR_MAP = {
-    "ي": "ی",
-    "ك": "ک",
-    "أ": "ا",
-    "إ": "ا",
-    "آ": "ا",
-    "ة": "ه",
-}
 
 # Tokens that should become single Alef class
 ALEF_WORD_TOKENS = {"الف", "آلف", "ألف", "إلف"}  # robust variants
@@ -43,8 +32,6 @@ def canon(s: str) -> str:
         return ""
     s = str(s).strip()
     s = s.replace(" ", "").replace("\u200c", "").replace("\ufeff", "")
-    for a, b in CHAR_MAP.items():
-        s = s.replace(a, b)
     return s
 
 

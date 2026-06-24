@@ -1,18 +1,18 @@
+import os
 import cv2
 import torch
 import torch.nn as nn
-from ultralytics import YOLO
 import numpy as np
 import pandas as pd
-import os
+from ultralytics import YOLO
 from tqdm import tqdm
 import editdistance
 
 # ==================== PATHS ====================
-YOLO_WEIGHTS = 'ir_plate_detector/weights/best.pt'
-CRNN_WEIGHTS = 'models/crnn/crnn_best.pt'
-TEST_CSV = 'data/ocr/test_labels.csv'
-TEST_IMAGE_DIR = 'data/test'
+YOLO_WEIGHTS = './ir_plate_detector/weights/best.pt'
+CRNN_WEIGHTS = './models/crnn/crnn_best.pt'
+TEST_CSV = './data/ocr/test_labels.csv'
+TEST_IMAGE_DIR = './data/test'
 
 # ==================== CRNN ====================
 class CRNN(nn.Module):
@@ -27,33 +27,50 @@ class CRNN(nn.Module):
             nn.MaxPool2d((2, 2), (2, 1), padding=(0, 1)),
             nn.Conv2d(512, 512, 2), nn.BatchNorm2d(512), nn.ReLU(),
         )
-        self.rnn = nn.LSTM(512, 256, 2, batch_first=True, bidirectional=True, dropout=0.3)
+        self.rnn = nn.LSTM(
+            512, 256, 2,
+            batch_first=True,
+            bidirectional=True,
+            dropout=0.3
+        )
         self.fc = nn.Linear(512, num_classes)
 
     def forward(self, x):
         conv = self.cnn(x)
-        conv = conv.squeeze(2).permute(0, 2, 1)  # B, T, C
+        conv = conv.squeeze(2).permute(0, 2, 1)
         rnn_out, _ = self.rnn(conv)
         return torch.log_softmax(self.fc(rnn_out), dim=2)
 
+
+# ==================== LOAD CRNN ====================
 def load_crnn(path, device):
     ckpt = torch.load(path, map_location=device)
+
     idx_to_char = {v: k for k, v in ckpt['chars'].items()}
+
     model = CRNN(num_classes=len(ckpt['chars'])).to(device)
     model.load_state_dict(ckpt['model'])
     model.eval()
+
     return model, idx_to_char
 
+
+# ==================== DECODE ====================
 def decode(logits, idx_to_char):
-    """Greedy CTC decode."""
     pred = torch.argmax(logits[0], dim=1).cpu().numpy()
-    text, prev = [], -1
+
+    text = []
+    prev = -1
+
     for p in pred:
-        if p != prev and p != 0:  # 0 = CTC blank
+        if p != prev and p != 0:   # CTC blank = 0
             text.append(idx_to_char.get(int(p), ''))
         prev = p
+
     return ''.join(text)
 
+
+# ==================== MAIN EVALUATION ====================
 def evaluate():
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Device: {device}")
@@ -62,88 +79,88 @@ def evaluate():
     yolo = YOLO(YOLO_WEIGHTS)
     crnn, idx_to_char = load_crnn(CRNN_WEIGHTS, device)
 
-    # Load test labels
-    if not os.path.exists(TEST_CSV):
-        print(f"❌ Not found: {TEST_CSV}")
-        return
-    test_df = pd.read_csv(TEST_CSV)
+    # Load CSV
+    df = pd.read_csv(TEST_CSV)
 
     predictions = []
     ground_truths = []
 
-    print(f"Evaluating {len(test_df)} test samples...")
+    print(f"Evaluating {len(df)} samples...")
 
-    for _, row in tqdm(test_df.iterrows(), total=len(test_df)):
+    for _, row in tqdm(df.iterrows(), total=len(df)):
+        gt = str(row['text'])
+        filename = str(row['filename'])
+
+        # match image
+        img_path = os.path.join(TEST_IMAGE_DIR, filename.replace('_plate.jpg', '.jpg'))
+
         pred_text = ""
-        gt_text = str(row['text'])
 
-        # Convert crop filename back to original image filename
-        plate_file = str(row['filename'])
-        orig_name = plate_file.replace('_plate.jpg', '.jpg').replace('_plate.png', '.png')
-        img_path = os.path.join(TEST_IMAGE_DIR, orig_name)
+        if not os.path.exists(img_path):
+            predictions.append("")
+            ground_truths.append(gt)
+            continue
 
-        if os.path.exists(img_path):
-            img = cv2.imread(img_path)
+        img = cv2.imread(img_path)
+        if img is None:
+            predictions.append("")
+            ground_truths.append(gt)
+            continue
 
-            if img is not None:
-                # YOLO Detection
-                results = yolo(img, verbose=False)[0]
+        # ================= YOLO =================
+        results = yolo(img, verbose=False)[0]
 
-                if results.boxes is not None and len(results.boxes) > 0:
-                    confs = results.boxes.conf.cpu().numpy()
-                    best_idx = int(np.argmax(confs))
-                    x1, y1, x2, y2 = results.boxes.xyxy[best_idx].cpu().numpy().astype(int)
+        if results.boxes is not None and len(results.boxes) > 0:
 
-                    # Safe crop
-                    h, w = img.shape[:2]
-                    x1, y1 = max(0, x1), max(0, y1)
-                    x2, y2 = min(w, x2), min(h, y2)
+            confs = results.boxes.conf.cpu().numpy()
+            best_idx = int(np.argmax(confs))
 
-                    plate_img = img[y1:y2, x1:x2]
+            x1, y1, x2, y2 = results.boxes.xyxy[best_idx].cpu().numpy().astype(int)
 
-                    if plate_img.size > 0:
-                        # EXACT preprocessing used in your good run
-                        processed = cv2.cvtColor(plate_img, cv2.COLOR_BGR2GRAY)
-                        processed = cv2.resize(processed, (128, 32))
+            h, w = img.shape[:2]
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(w, x2), min(h, y2)
 
-                        x = processed.astype(np.float32) / 255.0
-                        x = torch.from_numpy(x).unsqueeze(0).unsqueeze(0).to(device)
+            plate = img[y1:y2, x1:x2]
 
-                        with torch.no_grad():
-                            logits = crnn(x)
+            if plate.size > 0:
 
-                        pred_text = decode(logits, idx_to_char)
+                # ================= OCR preprocessing (MATCHES YOUR WORKING CODE) =================
+                gray = cv2.cvtColor(plate, cv2.COLOR_BGR2GRAY)
+                gray = cv2.resize(gray, (128, 32))
+
+                x = gray.astype(np.float32) / 255.0
+                x = torch.from_numpy(x).unsqueeze(0).unsqueeze(0).to(device)
+
+                with torch.no_grad():
+                    logits = crnn(x)
+
+                pred_text = decode(logits, idx_to_char)
 
         predictions.append(pred_text)
-        ground_truths.append(gt_text)
+        ground_truths.append(gt)
 
-    # Metrics
-    n = len(predictions)
-    if n == 0:
-        print("❌ No samples evaluated.")
-        return
-
+    # ================= METRICS =================
     exact = sum(p == g for p, g in zip(predictions, ground_truths))
+    total = len(predictions)
+
     total_chars = sum(len(g) for g in ground_truths)
     edits = sum(editdistance.eval(p, g) for p, g in zip(predictions, ground_truths))
 
-    exact_acc = (exact / n) * 100
-    cer = (edits / total_chars) * 100 if total_chars > 0 else 0.0
-    wer = ((n - exact) / n) * 100
-
     print("\n" + "=" * 50)
-    print(f"Exact Match Accuracy: {exact_acc:.2f}%")
-    print(f"Character Error Rate (CER): {cer:.2f}%")
-    print(f"Word Error Rate (WER): {wer:.2f}%")
+    print(f"Exact Match Accuracy: {(exact/total)*100:.2f}%")
+    print(f"CER: {(edits/total_chars)*100:.2f}%")
+    print(f"WER: {((total-exact)/total)*100:.2f}%")
     print("=" * 50)
 
     pd.DataFrame({
-        'predicted': predictions,
-        'ground_truth': ground_truths,
-        'correct': [p == g for p, g in zip(predictions, ground_truths)]
-    }).to_csv('evaluation_results.csv', index=False)
+        "predicted": predictions,
+        "ground_truth": ground_truths,
+        "correct": [p == g for p, g in zip(predictions, ground_truths)]
+    }).to_csv("evaluation_results.csv", index=False)
 
-    print("✅ Saved: evaluation_results.csv")
+    print("Saved: evaluation_results.csv")
+
 
 if __name__ == "__main__":
     evaluate()

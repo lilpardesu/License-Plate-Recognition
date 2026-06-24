@@ -25,7 +25,7 @@ def first_existing_dir(cands):
 
 
 def detect_layout():
-    # Layout A: OCR pipeline
+    # OCR pipeline
     ocr_train_csv = DATA_DIR / "ocr" / "train_labels.csv"
     ocr_val_csv = DATA_DIR / "ocr" / "validation_labels.csv"
     ocr_train_img = first_existing_dir([
@@ -41,13 +41,6 @@ def detect_layout():
 
     ocr_ok = ocr_train_csv.exists() and ocr_val_csv.exists() and ocr_train_img and ocr_val_img
 
-    # Layout B: PROCESSED pipeline
-    proc_train_csv = DATA_DIR / "train_ocr_labels.csv"
-    proc_val_csv = DATA_DIR / "validation_ocr_labels.csv"
-    proc_train_img = DATA_DIR / "processed" / "train" / "images"
-    proc_val_img = DATA_DIR / "processed" / "validation" / "images"
-
-    proc_ok = proc_train_csv.exists() and proc_val_csv.exists() and proc_train_img.exists() and proc_val_img.exists()
 
     if ocr_ok:
         return {
@@ -58,20 +51,10 @@ def detect_layout():
             "val_img_root": ocr_val_img,
         }
 
-    if proc_ok:
-        return {
-            "name": "PROCESSED",
-            "train_csv": proc_train_csv,
-            "val_csv": proc_val_csv,
-            "train_img_root": proc_train_img,
-            "val_img_root": proc_val_img,
-        }
-
     raise FileNotFoundError(
         "No complete layout found.\n"
-        "Need either:\n"
-        "  A) data/ocr/train_labels.csv + data/ocr/train/(plates_gray|plates|...)\n"
-        "  B) data/train_ocr_labels.csv + data/processed/train/images\n"
+        "Need:\n"
+        " data/ocr/train_labels.csv + data/ocr/train/(plates_gray|plates|...)\n"
     )
 
 
@@ -124,12 +107,8 @@ NUM_CLASSES = len(CHARS)
 DIGIT_MAP = {
     "۰": "0", "۱": "1", "۲": "2", "۳": "3", "۴": "4",
     "۵": "5", "۶": "6", "۷": "7", "۸": "8", "۹": "9",
-    "٠": "0", "١": "1", "٢": "2", "٣": "3", "٤": "4",
-    "٥": "5", "٦": "6", "٧": "7", "٨": "8", "٩": "9",
 }
-CHAR_MAP = {
-    "ي": "ی", "ك": "ک", "أ": "ا", "إ": "ا", "آ": "ا", "ة": "ه",
-}
+
 
 VALID_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
@@ -139,7 +118,6 @@ def normalize_text(s: str) -> str:
     out = []
     for ch in s:
         ch = DIGIT_MAP.get(ch, ch)
-        ch = CHAR_MAP.get(ch, ch)
         out.append(ch)
     return "".join(out)
 
